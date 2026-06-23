@@ -43,13 +43,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS agent_session (
-            id INTEGER PRIMARY KEY CHECK(id=1),
-            cookies TEXT,
-            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
     conn.commit()
     conn.close()
 
@@ -71,9 +64,10 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- مدير المتصفح العام ----------
+# ---------- مدير المتصفح الدائم ----------
 class BrowserManager:
     def __init__(self):
+        self.playwright = None
         self.browser = None
         self.context = None
         self.page = None
@@ -86,52 +80,48 @@ class BrowserManager:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
         self.page = await self.context.new_page()
+        # حقن لإخفاء علامات الأتمتة الأساسية
         await self.page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
         """)
-        # فتح الصفحة الرئيسية مرة واحدة لتجاوز Cloudflare
+        # فتح الصفحة الرئيسية وتجاوز Cloudflare
         logger.info("فتح الصفحة الرئيسية...")
         await self.page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
         await self.page.wait_for_timeout(8000)
         logger.info("تم تجاوز Cloudflare والمتصفح جاهز.")
 
     async def api_call(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
-        """ينفذ طلب API من داخل المتصفح ويعيد JSON"""
+        """يرسل طلب API من خلال page.request.post (الذي يشارك الكوكيز) مع ترويسات Client Hints"""
         url = f"{BASE_URL}{endpoint}"
-        js_code = """
-        async (params) => {
-            const response = await fetch(params.url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'Accept': 'application/json, text/plain, */*',
-                    'Referer': params.baseUrl + '/login'
-                },
-                body: JSON.stringify(params.data)
-            });
-            const text = await response.text();
-            return { status: response.status, body: text };
+        headers = {
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": BASE_URL + "/login",
+            "Origin": BASE_URL,
+            "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Keep-Alive": "True"
         }
-        """
         try:
-            result = await self.page.evaluate(js_code, {"url": url, "data": data, "baseUrl": BASE_URL})
-            if result["status"] == 200:
+            response = await self.page.request.post(url, data=json.dumps(data), headers=headers)
+            body = await response.text()
+            if response.status == 200:
                 try:
-                    return json.loads(result["body"])
+                    return json.loads(body)
                 except:
-                    return {"raw": result["body"]}
+                    return {"raw": body}
             else:
-                logger.error(f"API call failed: {result['status']} - {result['body'][:300]}")
+                logger.error(f"API call failed: {response.status} - {body[:300]}")
                 return None
         except Exception as e:
-            logger.exception(f"Browser API call error for {endpoint}")
+            logger.exception(f"Error calling API {endpoint}")
             return None
 
     async def login(self) -> bool:
-        """تسجيل دخول الوكيل"""
         payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
         result = await self.api_call("/global/api/User/signIn", payload)
         if result is not None:
@@ -141,20 +131,18 @@ class BrowserManager:
         return False
 
     async def close(self):
-        await self.browser.close()
-        await self.playwright.stop()
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
 
 browser_mgr = BrowserManager()
 
-# ---------- دالة مساعدة لاستدعاء API عبر المتصفح ----------
+# ---------- دالة استدعاء API مختصرة ----------
 async def call_api(endpoint: str, data: dict) -> Optional[dict]:
-    try:
-        return await browser_mgr.api_call(endpoint, data)
-    except Exception as e:
-        logger.exception("call_api failed")
-        return None
+    return await browser_mgr.api_call(endpoint, data)
 
-# ---------- أوامر البوت ----------
+# ---------- البوت ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -250,10 +238,10 @@ async def cmd_withdraw(message: Message):
 scheduler = AsyncIOScheduler()
 
 async def session_keepalive():
-    # نقوم بعمل طلب خفيف للتأكد من أن الجلسة ما زالت صالحة
+    logger.info("فحص صحة الجلسة...")
     test = await browser_mgr.api_call("/global/api/Statistics/getPlayersStatisticsPro", {"start":0,"limit":1,"filter":{}})
     if test is None:
-        logger.warning("جلسة المتصفح ضعيفة، إعادة تشغيل المتصفح...")
+        logger.warning("فشل اختبار الجلسة، إعادة تشغيل المتصفح...")
         await browser_mgr.close()
         await browser_mgr.start()
         await browser_mgr.login()
@@ -262,9 +250,9 @@ async def session_keepalive():
 async def lifespan(app: FastAPI):
     init_db()
     await browser_mgr.start()
-    success = await browser_mgr.login()
-    if not success:
-        logger.error("فشل تسجيل الدخول الأولي. الخدمة ستعمل لكن البوت قد لا يستجيب.")
+    login_ok = await browser_mgr.login()
+    if not login_ok:
+        logger.error("تعذر تسجيل الدخول الأولي. سيتم إعادة المحاولة.")
     scheduler.add_job(session_keepalive, "interval", minutes=5)
     scheduler.start()
     webhook_url = f"{WEBHOOK_URL}/webhook"
