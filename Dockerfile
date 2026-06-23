@@ -2,7 +2,6 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# تثبيت الاعتماديات الخفيفة لـ curl_cffi
 RUN apt-get update && apt-get install -y \
     libcurl4 \
     && rm -rf /var/lib/apt/lists/*
