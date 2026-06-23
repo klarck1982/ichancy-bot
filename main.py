@@ -31,6 +31,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 DB_PATH = "bot_data.db"
 
+# ---------- قاعدة البيانات ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -86,7 +87,7 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- تسجيل الدخول (Playwright فقط مع حقن مضاد للكشف) ----------
+# ---------- تسجيل الدخول (معدلة لاستخدام aiohttp مع كوكيز المتصفح) ----------
 async def playwright_login() -> Optional[str]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -108,31 +109,38 @@ async def playwright_login() -> Optional[str]:
             await page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(8000)
 
+            # جمع الكوكيز التي اكتسبتها الصفحة (بما فيها Cloudflare clearance)
+            playwright_cookies = await context.cookies()
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in playwright_cookies])
+            logger.info("كوكيز المتصفح بعد تحميل الصفحة الرئيسية: " + cookie_str[:200])
+
+            # الآن نرسل طلب تسجيل الدخول عبر aiohttp باستخدام هذه الكوكيز
             login_url = f"{BASE_URL}/global/api/User/signIn"
             login_payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
-            logger.info("إرسال طلب تسجيل الدخول...")
-            response = await page.request.post(
-                login_url,
-                data=json.dumps(login_payload),
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Accept": "application/json, text/plain, */*",
-                    "Referer": BASE_URL + "/login"
-                }
-            )
-            body_text = await response.text()
-            logger.info(f"استجابة تسجيل الدخول: {response.status} - البداية: {body_text[:200]}")
+            headers = {
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/plain, */*",
+                "Referer": BASE_URL + "/login",
+                "Cookie": cookie_str,
+                "Keep-Alive": "True"
+            }
+            logger.info("إرسال طلب تسجيل الدخول عبر aiohttp...")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(login_url, json=login_payload, headers=headers, timeout=30) as resp:
+                    body_text = await resp.text()
+                    logger.info(f"استجابة تسجيل الدخول: {resp.status} - البداية: {body_text[:200]}")
+                    if resp.status != 200:
+                        logger.error(f"فشل تسجيل الدخول: {resp.status} - {body_text[:500]}")
+                        return None
 
-            if response.status != 200:
-                logger.error(f"فشل تسجيل الدخول: {response.status} - {body_text[:500]}")
-                return None
+                    # نجاح تسجيل الدخول: نجمع الكوكيز من جديد (قد تضاف كوكيز جلسة جديدة)
+                    # ندمج الكوكيز القديمة مع الجديدة (عادةً تكفي القديمة لكن الأفضل إعادة جمع كل الكوكيز من السياق)
+                    updated_cookies = await context.cookies()
+                    final_cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in updated_cookies])
+                    logger.info("تم تسجيل الدخول بنجاح وجمع الكوكيز النهائية")
+                    return final_cookie_str
 
-            await page.wait_for_timeout(2000)
-            cookies = await context.cookies()
-            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            logger.info("تم جمع الكوكيز بنجاح")
-            return cookie_str
         except Exception as e:
             logger.exception("خطأ أثناء تسجيل الدخول")
             return None
@@ -198,7 +206,7 @@ async def api_call(endpoint: str, data: dict) -> Optional[dict]:
         logger.exception(f"استثناء أثناء استدعاء {endpoint}")
         return None
 
-# ---------- أوامر البوت ----------
+# ---------- أوامر البوت (لم تتغير) ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
