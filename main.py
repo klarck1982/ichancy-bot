@@ -4,7 +4,6 @@ import logging
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any
-from urllib.parse import urljoin
 
 from dotenv import load_dotenv
 import aiohttp
@@ -14,7 +13,7 @@ from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from fastapi import FastAPI, Request
 import uvicorn
-from playwright.async_api import async_playwright
+from curl_cffi import requests as curl_requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
@@ -66,152 +65,81 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- مدير المتصفح (انتظار الكوكيز ثم fetch) ----------
-class BrowserManager:
+# ---------- مدير الجلسة باستخدام curl_cffi ----------
+class SessionManager:
     def __init__(self):
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
-        self.cookies_str = ""
+        self.session = None
+        self.cookies = None
 
-    async def start(self):
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=True)
-        self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        )
-        self.page = await self.context.new_page()
+    def login(self):
+        # إنشاء جلسة curl_cffi ببصمة Chrome 120
+        self.session = curl_requests.Session(impersonate="chrome120")
 
-        # إخفاء خصائص الأتمتة
-        await self.page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            window.chrome = { runtime: {} };
-        """)
-
-        # 1. فتح صفحة الدخول
-        login_page_url = urljoin(BASE_URL, "/login")
-        logger.info("زيارة صفحة الدخول...")
-        await self.page.goto(login_page_url, wait_until="networkidle", timeout=60000)
-
-        # 2. الانتظار حتى نحصل على كل من cf_clearance و __cf_bm (معًا)
-        logger.info("انتظار كوكيز Cloudflare (cf_clearance و __cf_bm)...")
-        for i in range(20):  # 20 محاولة، كل مرة ننتظر 1.5 ثانية
-            cookies = {c["name"]: c["value"] for c in await self.context.cookies()}
-            if "cf_clearance" in cookies and "__cf_bm" in cookies:
-                logger.info(f"تم الحصول على الكوكيز المطلوبة: cf_clearance={cookies['cf_clearance'][:30]}..., __cf_bm={cookies['__cf_bm'][:30]}...")
-                break
-            await self.page.wait_for_timeout(1500)
-        else:
-            logger.warning("لم يتم الحصول على __cf_bm، استمرار مع cf_clearance فقط")
-
-        # 3. تسجيل الدخول عبر fetch من داخل الصفحة
-        login_payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
-        login_url = f"{BASE_URL}/global/api/User/signIn"
-        js_code = """
-        async (params) => {
-            const response = await fetch(params.url, {
-                method: 'POST',
-                credentials: 'include',  // مهم: يرسل الكوكيز مع الطلب
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'Accept': 'application/json, text/plain, */*',
-                    'Referer': params.loginPageUrl
-                },
-                body: JSON.stringify(params.data)
-            });
-            const text = await response.text();
-            return { status: response.status, body: text };
-        }
-        """
-        result = await self.page.evaluate(js_code, {
-            "url": login_url,
-            "data": login_payload,
-            "loginPageUrl": login_page_url
+        # 1. زيارة الصفحة الرئيسية للحصول على كوكيز Cloudflare
+        logger.info("طلب الصفحة الرئيسية للحصول على كوكيز Cloudflare...")
+        resp = self.session.get(BASE_URL, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         })
-        if result["status"] == 200:
-            logger.info("تسجيل الدخول ناجح.")
-        else:
-            logger.error(f"فشل تسجيل الدخول: {result['status']} - {result['body'][:300]}")
-            # محاولة بديلة باستخدام page.request.post مع الكوكيز المستخرجة
-            logger.info("محاولة بديلة باستخدام page.request.post...")
-            cookies_list = await self.context.cookies()
-            headers = {
-                "Content-Type": "application/json",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": login_page_url,
-                "Origin": BASE_URL,
-                "Cookie": "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
-            }
-            resp = await self.page.request.post(login_url, data=json.dumps(login_payload), headers=headers)
-            if resp.status == 200:
-                logger.info("تسجيل الدخول نجح عبر الطريقة البديلة.")
-            else:
-                logger.error(f"الطريقة البديلة فشلت: {resp.status} - {await resp.text()[:300]}")
+        logger.info(f"استجابة الصفحة الرئيسية: {resp.status_code}")
 
-        # 4. جمع الكوكيز النهائية (يجب أن تحتوي الآن على PHPSESSID)
-        cookies_list = await self.context.cookies()
-        self.cookies_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
-        logger.info("تم تحديث الكوكيز النهائية.")
-
-        # 5. اختبار الجلسة
-        if not await self.test_session():
-            logger.error("فشل اختبار الجلسة بعد تسجيل الدخول!")
-        else:
-            logger.info("الجلسة صالحة وجاهزة.")
-
-    async def test_session(self) -> bool:
-        test_url = f"{BASE_URL}/global/api/Statistics/getPlayersStatisticsPro"
-        payload = {"start": 0, "limit": 1, "filter": {}}
+        # 2. تسجيل الدخول
+        login_url = f"{BASE_URL}/global/api/User/signIn"
+        login_payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
         headers = {
-            "Cookie": self.cookies_str,
-            "Keep-Alive": "True",
-            "Content-Type": "application/json"
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(test_url, json=payload, headers=headers, timeout=15) as resp:
-                    return resp.status == 200
-        except:
-            return False
-
-    async def api_call(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
-        url = f"{BASE_URL}{endpoint}"
-        headers = {
-            "Cookie": self.cookies_str,
-            "Keep-Alive": "True",
             "Content-Type": "application/json",
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": urljoin(BASE_URL, "/login"),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": BASE_URL + "/login",
+            "Origin": BASE_URL
+        }
+        logger.info("إرسال طلب تسجيل الدخول...")
+        resp = self.session.post(login_url, json=login_payload, headers=headers)
+        if resp.status_code == 200:
+            logger.info("تم تسجيل الدخول بنجاح.")
+            self.cookies = self.session.cookies.get_dict()
+            return True
+        else:
+            logger.error(f"فشل تسجيل الدخول: {resp.status_code} - {resp.text[:300]}")
+            return False
+
+    def api_call(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
+        url = f"{BASE_URL}{endpoint}"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": BASE_URL + "/login",
             "Origin": BASE_URL
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=data, headers=headers, timeout=30) as resp:
-                    body = await resp.text()
-                    if resp.status == 200:
-                        return json.loads(body)
-                    else:
-                        logger.error(f"API call failed: {resp.status} - {body[:200]}")
-                        return None
+            resp = self.session.post(url, json=data, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                logger.error(f"API call failed: {resp.status_code} - {resp.text[:200]}")
+                return None
         except Exception as e:
             logger.exception(f"Error calling API {endpoint}")
             return None
 
-    async def close(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
+    def test_session(self) -> bool:
+        test_url = f"{BASE_URL}/global/api/Statistics/getPlayersStatisticsPro"
+        payload = {"start": 0, "limit": 1, "filter": {}}
+        try:
+            resp = self.session.post(test_url, json=payload, headers={
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": BASE_URL + "/login"
+            })
+            return resp.status_code == 200
+        except:
+            return False
 
-browser_mgr = BrowserManager()
+session_mgr = SessionManager()
 
+# ---------- دوال مساعدة ----------
 async def call_api(endpoint: str, data: dict) -> Optional[dict]:
-    return await browser_mgr.api_call(endpoint, data)
+    return session_mgr.api_call(endpoint, data)
 
 # ---------- البوت ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -308,18 +236,19 @@ async def cmd_withdraw(message: Message):
 # ---------- دورة الحياة ----------
 scheduler = AsyncIOScheduler()
 
-async def session_keepalive():
+def session_keepalive():
     logger.info("فحص صحة الجلسة...")
-    if not await browser_mgr.test_session():
-        logger.warning("فشل اختبار الجلسة، إعادة تشغيل المتصفح...")
-        await browser_mgr.close()
-        await browser_mgr.start()
+    if not session_mgr.test_session():
+        logger.warning("فشل اختبار الجلسة، إعادة تسجيل الدخول...")
+        session_mgr.login()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    await browser_mgr.start()
-    scheduler.add_job(session_keepalive, "interval", minutes=5)
+    success = session_mgr.login()
+    if not success:
+        logger.error("فشل تسجيل الدخول الأولي. البوت قد لا يعمل.")
+    scheduler.add_job(session_keepalive, "interval", minutes=10)
     scheduler.start()
     webhook_url = f"{WEBHOOK_URL}/webhook"
     await bot.set_webhook(webhook_url)
@@ -327,7 +256,6 @@ async def lifespan(app: FastAPI):
     yield
     await bot.delete_webhook()
     scheduler.shutdown()
-    await browser_mgr.close()
 
 app = FastAPI(lifespan=lifespan)
 
