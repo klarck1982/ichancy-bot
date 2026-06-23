@@ -14,16 +14,14 @@ from aiogram.client.default import DefaultBotProperties
 from fastapi import FastAPI, Request
 import uvicorn
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
 
-# ---------- إعداد السجلات ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------- المتغيرات ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 AGENT_USERNAME = os.getenv("AGENT_USERNAME")
 AGENT_PASSWORD = os.getenv("AGENT_PASSWORD")
@@ -32,7 +30,6 @@ BASE_URL = os.getenv("BASE_URL", "https://agents.ichancy.com")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 10000))
 
-# ---------- قاعدة البيانات ----------
 DB_PATH = "bot_data.db"
 
 def init_db():
@@ -70,10 +67,7 @@ def db_get_session_cookies() -> Optional[str]:
 def db_save_session_cookies(cookies: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
-        INSERT OR REPLACE INTO agent_session (id, cookies, last_login)
-        VALUES (1, ?, CURRENT_TIMESTAMP)
-    """, (cookies,))
+    c.execute("INSERT OR REPLACE INTO agent_session (id, cookies, last_login) VALUES (1, ?, CURRENT_TIMESTAMP)", (cookies,))
     conn.commit()
     conn.close()
 
@@ -95,7 +89,7 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- Playwright: تسجيل الدخول (معدلة) ----------
+# ---------- Playwright تسجيل الدخول (باستخدام Stealth ومحاكاة أفضل) ----------
 async def playwright_login() -> Optional[str]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -104,43 +98,43 @@ async def playwright_login() -> Optional[str]:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
-        # تفعيل التخفي
-        await stealth_async(page)
+
+        # تطبيق stealth كامل
+        stealth = Stealth()
+        await stealth.apply(page)
 
         try:
-            # 1. زيارة الصفحة الرئيسية وتجاوز تحدي Cloudflare
+            # 1. زيارة الصفحة الرئيسية وانتظار طويل لتجاوز Cloudflare
             logger.info("فتح الصفحة الرئيسية...")
             await page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
-            # انتظار إضافي لضمان انتهاء أي تحدي
-            await page.wait_for_timeout(7000)
+            await page.wait_for_timeout(8000)  # انتظر 8 ثوان
 
-            # 2. تسجيل الدخول باستخدام fetch داخل الصفحة لضمان مشاركة كل الكوكيز
+            # 2. تسجيل الدخول: استخدام page.request.post لكن مع ترويسات إضافية
             login_url = f"{BASE_URL}/global/api/User/signIn"
             login_payload = {
                 "username": AGENT_USERNAME,
                 "password": AGENT_PASSWORD
             }
-            logger.info("إرسال طلب تسجيل الدخول من داخل الصفحة...")
-            # استخدم page.evaluate لإجراء طلب POST من داخل سياق المتصفح
-            result = await page.evaluate("""
-                async (url, payload) => {
-                    const response = await fetch(url, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                    return { status: response.status, body: await response.text() };
-                }
-            """, login_url, login_payload)
+            headers = {
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/plain, */*",
+                "Referer": BASE_URL + "/login"
+            }
+            logger.info("إرسال طلب تسجيل الدخول...")
+            response = await page.request.post(
+                login_url,
+                data=json.dumps(login_payload),
+                headers=headers
+            )
+            body_text = await response.text()
+            logger.info(f"استجابة تسجيل الدخول: الحالة {response.status} - المقطع الأول: {body_text[:200]}")
 
-            if result["status"] != 200:
-                logger.error(f"فشل تسجيل الدخول: {result['status']} - {result['body'][:200]}")
+            if response.status != 200:
+                logger.error(f"فشل تسجيل الدخول: {response.status} - {body_text[:500]}")
                 return None
 
-            # 3. انتظار قصير
+            # 3. انتظار قصير وجمع الكوكيز
             await page.wait_for_timeout(2000)
-
-            # 4. جمع الكوكيز
             cookies = await context.cookies()
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             logger.info("تم جمع الكوكيز بنجاح")
@@ -223,7 +217,7 @@ async def api_call(endpoint: str, data: dict) -> Optional[dict]:
         logger.exception(f"استثناء أثناء استدعاء {endpoint}")
         return None
 
-# ---------- أوامر البوت (لم تتغير) ----------
+# ---------- أوامر البوت (كما هي) ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -231,18 +225,9 @@ dp = Dispatcher()
 async def cmd_start(message: Message):
     user = db_get_user(message.from_user.id)
     if user:
-        await message.answer(
-            "أهلاً بعودتك! أنت مسجل بالفعل.\n"
-            "استخدم الأوامر:\n"
-            "/balance - عرض الرصيد\n"
-            "/deposit <المبلغ> - إيداع\n"
-            "/withdraw <المبلغ> - سحب"
-        )
+        await message.answer("أهلاً بعودتك! أنت مسجل بالفعل.\nاستخدم الأوامر:\n/balance - عرض الرصيد\n/deposit <المبلغ> - إيداع\n/withdraw <المبلغ> - سحب")
     else:
-        await message.answer(
-            "مرحبًا! أنت لم تسجل لاعبًا بعد.\n"
-            "أرسل /register لإنشاء لاعب جديد تلقائيًا."
-        )
+        await message.answer("مرحبًا! أنت لم تسجل لاعبًا بعد.\nأرسل /register لإنشاء لاعب جديد تلقائيًا.")
 
 @dp.message(Command("register"))
 async def cmd_register(message: Message):
@@ -269,11 +254,7 @@ async def cmd_register(message: Message):
         player_id = result["playerId"]
         db_create_user(telegram_id, player_id, email, login)
         await message.answer(
-            f"✅ تم إنشاء لاعبك بنجاح!\n\n"
-            f"<b>معرف اللاعب:</b> <code>{player_id}</code>\n"
-            f"<b>البريد:</b> {email}\n"
-            f"<b>كلمة المرور:</b> {password}\n\n"
-            "يمكنك الآن استخدام:\n/balance - لمعرفة رصيدك\n/deposit <المبلغ> - إيداع\n/withdraw <المبلغ> - سحب"
+            f"✅ تم إنشاء لاعبك بنجاح!\n\n<b>معرف اللاعب:</b> <code>{player_id}</code>\n<b>البريد:</b> {email}\n<b>كلمة المرور:</b> {password}\n\nاستخدم:\n/balance - لمعرفة رصيدك\n/deposit <المبلغ> - إيداع\n/withdraw <المبلغ> - سحب"
         )
     else:
         await message.answer("❌ فشل إنشاء اللاعب. قد يكون الوكيل غير مصرح له أو هناك مشكلة في الخدمة.")
@@ -301,18 +282,11 @@ async def cmd_deposit(message: Message):
     try:
         amount_str = message.text.split()[1]
         amount = float(amount_str)
-        if amount <= 0:
-            raise ValueError
-    except (IndexError, ValueError):
+        if amount <= 0: raise ValueError
+    except:
         await message.answer("الرجاء إدخال مبلغ موجب. مثال: /deposit 500")
         return
-    payload = {
-        "amount": amount,
-        "comment": None,
-        "playerId": user["player_id"],
-        "currencyCode": "NSP",
-        "moneyStatus": 5
-    }
+    payload = {"amount": amount, "comment": None, "playerId": user["player_id"], "currencyCode": "NSP", "moneyStatus": 5}
     result = await api_call("/global/api/Player/depositToPlayer", payload)
     if result:
         await message.answer(f"✅ تم إيداع {amount} NSP بنجاح.\nاستخدم /balance للتحقق من رصيدك.")
@@ -328,18 +302,11 @@ async def cmd_withdraw(message: Message):
     try:
         amount_str = message.text.split()[1]
         amount = float(amount_str)
-        if amount <= 0:
-            raise ValueError
-    except (IndexError, ValueError):
+        if amount <= 0: raise ValueError
+    except:
         await message.answer("الرجاء إدخال مبلغ موجب. مثال: /withdraw 200")
         return
-    payload = {
-        "amount": -amount,
-        "comment": None,
-        "playerId": user["player_id"],
-        "currencyCode": "NSP",
-        "moneyStatus": 5
-    }
+    payload = {"amount": -amount, "comment": None, "playerId": user["player_id"], "currencyCode": "NSP", "moneyStatus": 5}
     result = await api_call("/global/api/Player/withdrawFromPlayer", payload)
     if result:
         await message.answer(f"✅ تم سحب {amount} NSP بنجاح.\nاستخدم /balance للتحقق من رصيدك.")
@@ -352,11 +319,8 @@ scheduler = AsyncIOScheduler()
 async def session_keepalive():
     logger.info("فحص دوري للجلسة...")
     cookies = db_get_session_cookies()
-    if not cookies:
+    if not cookies or not await test_session(cookies):
         await refresh_session()
-    else:
-        if not await test_session(cookies):
-            await refresh_session()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
