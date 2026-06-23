@@ -14,14 +14,11 @@ from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from fastapi import FastAPI, Request
 import uvicorn
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
 
-# تفعيل تسجيل الأخطاء بالتفصيل
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-logging.getLogger("aiogram").setLevel(logging.DEBUG)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 AGENT_USERNAME = os.getenv("AGENT_USERNAME")
@@ -117,26 +114,36 @@ async def api_call(endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
         logger.exception(f"Error calling API {endpoint}")
         return None
 
-# ---------- بوت تيليجرام ----------
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+# ---------- بوت تيليجرام (مع إصلاح parse_mode) ----------
+# استخدام None يعني نص عادي، لا تحليل HTML
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
 dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("مرحبًا! أرسل /setcookie مع الكوكيز لبدء العمل.")
+    await message.answer(
+        "مرحبًا! هذا بوت إدارة حسابات Ichancy.\n\n"
+        "للبدء، أرسل كوكيز الجلسة عبر:\n"
+        "/setcookie PHPSESSID=abc; cf_clearance=xyz; ...\n\n"
+        "بعدها يمكنك استخدام:\n"
+        "/register - إنشاء لاعب\n"
+        "/balance - عرض الرصيد\n"
+        "/deposit مبلغ - إيداع\n"
+        "/withdraw مبلغ - سحب"
+    )
 
 @dp.message(Command("setcookie"))
 async def cmd_setcookie(message: Message):
     try:
         cookie_text = message.text.replace("/setcookie", "").strip()
         if not cookie_text:
-            await message.answer("❌ يرجى إرسال الكوكيز بعد الأمر.")
+            await message.answer("❌ يرجى إرسال الكوكيز بعد الأمر.\nمثال:\n/setcookie PHPSESSID=abc; cf_clearance=xyz; ...")
             return
         db_save_session_cookies(cookie_text)
-        await message.answer("✅ تم حفظ الكوكيز بنجاح!")
+        await message.answer("✅ تم حفظ الكوكيز بنجاح! يمكنك الآن استخدام /register أو /balance.")
     except Exception as e:
         logger.exception("Error saving cookies")
-        await message.answer("فشل حفظ الكوكيز.")
+        await message.answer("فشل حفظ الكوكيز. تأكد من الصيغة.")
 
 @dp.message(Command("register"))
 async def cmd_register(message: Message):
@@ -145,7 +152,7 @@ async def cmd_register(message: Message):
         await message.answer("لديك لاعب بالفعل.")
         return
     if not db_get_session_cookies():
-        await message.answer("لا توجد جلسة. أرسل /setcookie أولاً.")
+        await message.answer("لا توجد جلسة محفوظة. أرسل /setcookie أولاً.")
         return
     telegram_id = message.from_user.id
     login = f"tg{telegram_id}"
@@ -166,9 +173,11 @@ async def cmd_register(message: Message):
         player_id = result["playerId"]
         db_create_user(telegram_id, player_id, email, login)
         await message.answer(
-            f"✅ تم إنشاء لاعبك!\n<b>المعرف:</b> <code>{player_id}</code>\n"
-            f"البريد: {email}\nكلمة المرور: {password}\n\n"
-            "استخدم:\n/balance\n/deposit <المبلغ>\n/withdraw <المبلغ>"
+            f"✅ تم إنشاء لاعبك!\n"
+            f"المعرف: {player_id}\n"
+            f"البريد: {email}\n"
+            f"كلمة المرور: {password}\n\n"
+            "استخدم:\n/balance\n/deposit مبلغ\n/withdraw مبلغ"
         )
     else:
         await message.answer("❌ فشل إنشاء اللاعب. ربما الكوكيز غير صالحة.")
