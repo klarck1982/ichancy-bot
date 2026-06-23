@@ -7,6 +7,7 @@ from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
 from dotenv import load_dotenv
+import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -65,13 +66,14 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- مدير المتصفح الدائم ----------
+# ---------- مدير المتصفح (يحاكي المستخدم الحقيقي) ----------
 class BrowserManager:
     def __init__(self):
         self.playwright = None
         self.browser = None
         self.context = None
         self.page = None
+        self.cookies_str = ""
 
     async def start(self):
         self.playwright = await async_playwright().start()
@@ -81,76 +83,123 @@ class BrowserManager:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
         self.page = await self.context.new_page()
+
+        # إخفاء علامات الأتمتة بشكل موسع
         await self.page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            // إخفاء webdriver
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            // تزوير plugins
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+            // تزوير languages
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            // تزوير chrome
+            window.chrome = { runtime: {} };
+            // تزوير permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+            );
         """)
 
-        # 1. زيارة صفحة تسجيل الدخول (تضمن إنشاء جلسة PHP وCSRF)
+        # 1. زيارة صفحة تسجيل الدخول (تجاوز Cloudflare وتكوين الجلسة)
         login_page_url = urljoin(BASE_URL, "/login")
-        logger.info(f"زيارة صفحة تسجيل الدخول: {login_page_url}")
+        logger.info(f"زيارة صفحة الدخول: {login_page_url}")
         await self.page.goto(login_page_url, wait_until="networkidle", timeout=60000)
         await self.page.wait_for_timeout(5000)
 
-        # 2. استخراج رمز CSRF إذا وُجد (في العادة داخل meta أو input مخفي)
-        csrf_token = await self.page.evaluate("""
-            () => {
-                const meta = document.querySelector('meta[name="csrf-token"]');
-                if (meta) return meta.content;
-                const input = document.querySelector('input[name="_csrf"]');
-                if (input) return input.value;
-                return null;
-            }
-        """)
-        self.csrf_token = csrf_token
-        if csrf_token:
-            logger.info(f"تم العثور على CSRF token: {csrf_token[:20]}...")
+        # 2. ملء نموذج الدخول وتسجيل الدخول
+        logger.info("ملء بيانات الدخول...")
+        try:
+            # نبحث عن حقول البريد وكلمة المرور (قد تختلف selectors، نستخدم أسماء شائعة)
+            await self.page.fill('input[type="email"], input[name="email"], input[name="username"]', AGENT_USERNAME)
+            await self.page.fill('input[type="password"], input[name="password"]', AGENT_PASSWORD)
+            # التقاط صورة للنموذج إذا أردت (اختياري)
+            # await self.page.screenshot(path="login_form.png")
+            await self.page.click('button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Sign in")')
+            # انتظر حتى يتم التحويل أو ظهور رسالة نجاح
+            await self.page.wait_for_load_state("networkidle")
+            await self.page.wait_for_timeout(3000)
+            logger.info("تم تقديم نموذج الدخول.")
+        except Exception as e:
+            logger.error(f"خطأ أثناء ملء النموذج: {e}")
+            # محاولة بديلة: إرسال طلب API مباشر كحل أخير
+            await self.api_login_fallback()
+
+        # 3. جمع الكوكيز النهائية
+        cookies = await self.context.cookies()
+        self.cookies_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        logger.info(f"تم جمع الكوكيز: {self.cookies_str[:200]}...")
+        # اختبار سريع للجلسة
+        if not await self.test_session():
+            logger.error("فشل اختبار الجلسة بعد تسجيل الدخول!")
         else:
-            logger.info("لم يتم العثور على CSRF token (قد لا يكون مطلوباً)")
+            logger.info("الجلسة صالحة وتم تسجيل الدخول بنجاح.")
 
-        logger.info("تم تحميل صفحة الدخول وجمع الجلسة.")
-
-    async def api_call(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
-        url = f"{BASE_URL}{endpoint}"
+    async def api_login_fallback(self):
+        """خطة بديلة: إرسال طلب API مباشر بنفس الكوكيز الحالية"""
+        payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
+        url = f"{BASE_URL}/global/api/User/signIn"
         headers = {
             "Content-Type": "application/json",
             "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/plain, */*",
             "Referer": urljoin(BASE_URL, "/login"),
             "Origin": BASE_URL,
-            "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "Keep-Alive": "True"
+            "Cookie": self.cookies_str
         }
-        # إضافة رمز CSRF إن وُجد
-        if self.csrf_token:
-            headers["X-CSRF-TOKEN"] = self.csrf_token
-
         try:
-            response = await self.page.request.post(url, data=json.dumps(data), headers=headers)
-            body = await response.text()
-            if response.status == 200:
-                try:
-                    return json.loads(body)
-                except:
-                    return {"raw": body}
-            else:
-                logger.error(f"API call failed: {response.status} - {body[:300]}")
-                return None
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        logger.info("تم تسجيل الدخول عبر API الاحتياطي.")
+                    else:
+                        logger.error(f"فشل API الاحتياطي: {resp.status}")
+        except Exception as e:
+            logger.error(f"خطأ في API الاحتياطي: {e}")
+
+    async def test_session(self) -> bool:
+        """اختبار صلاحية الجلسة عبر API خفيف"""
+        test_url = f"{BASE_URL}/global/api/Statistics/getPlayersStatisticsPro"
+        payload = {"start": 0, "limit": 1, "filter": {}}
+        headers = {
+            "Cookie": self.cookies_str,
+            "Keep-Alive": "True",
+            "Content-Type": "application/json"
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(test_url, json=payload, headers=headers, timeout=15) as resp:
+                    return resp.status == 200
+        except:
+            return False
+
+    async def api_call(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
+        """استدعاء API باستخدام كوكيز الجلسة المخزنة"""
+        url = f"{BASE_URL}{endpoint}"
+        headers = {
+            "Cookie": self.cookies_str,
+            "Keep-Alive": "True",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": urljoin(BASE_URL, "/login"),
+            "Origin": BASE_URL
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=data, headers=headers, timeout=30) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        try:
+                            return json.loads(body)
+                        except:
+                            return {"raw": body}
+                    else:
+                        logger.error(f"API call failed: {resp.status} - {body[:200]}")
+                        return None
         except Exception as e:
             logger.exception(f"Error calling API {endpoint}")
             return None
-
-    async def login(self) -> bool:
-        payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
-        result = await self.api_call("/global/api/User/signIn", payload)
-        if result is not None:
-            logger.info("تم تسجيل الدخول بنجاح.")
-            return True
-        logger.error("فشل تسجيل الدخول.")
-        return False
 
     async def close(self):
         if self.browser:
@@ -163,7 +212,7 @@ browser_mgr = BrowserManager()
 async def call_api(endpoint: str, data: dict) -> Optional[dict]:
     return await browser_mgr.api_call(endpoint, data)
 
-# ---------- البوت (بدون تغيير) ----------
+# ---------- البوت (كما هو) ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -260,20 +309,15 @@ scheduler = AsyncIOScheduler()
 
 async def session_keepalive():
     logger.info("فحص صحة الجلسة...")
-    test = await browser_mgr.api_call("/global/api/Statistics/getPlayersStatisticsPro", {"start":0,"limit":1,"filter":{}})
-    if test is None:
+    if not await browser_mgr.test_session():
         logger.warning("فشل اختبار الجلسة، إعادة تشغيل المتصفح...")
         await browser_mgr.close()
         await browser_mgr.start()
-        await browser_mgr.login()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     await browser_mgr.start()
-    login_ok = await browser_mgr.login()
-    if not login_ok:
-        logger.error("تعذر تسجيل الدخول الأولي.")
     scheduler.add_job(session_keepalive, "interval", minutes=5)
     scheduler.start()
     webhook_url = f"{WEBHOOK_URL}/webhook"
