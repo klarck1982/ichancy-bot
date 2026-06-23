@@ -14,8 +14,10 @@ from aiogram.client.default import DefaultBotProperties
 from fastapi import FastAPI, Request
 import uvicorn
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# استخدام playwright-extra للتهرب من الكشف
+from playwright_extra import async_playwright as extra_playwright
 
 load_dotenv()
 
@@ -32,6 +34,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 DB_PATH = "bot_data.db"
 
+# ---------- قاعدة البيانات ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -87,45 +90,44 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- تسجيل الدخول مع stealth_async ----------
+# ---------- تسجيل الدخول عبر Playwright (مع stealth مدمج من playwright-extra) ----------
 async def playwright_login() -> Optional[str]:
-    async with async_playwright() as p:
+    async with extra_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
-        # تطبيق التخفي
-        await stealth_async(page)
 
         try:
+            # 1. تحميل الصفحة الرئيسية لتمرير Cloudflare
             logger.info("فتح الصفحة الرئيسية...")
             await page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(8000)
 
+            # 2. تسجيل الدخول
             login_url = f"{BASE_URL}/global/api/User/signIn"
             login_payload = {
                 "username": AGENT_USERNAME,
                 "password": AGENT_PASSWORD
             }
-            headers = {
-                "Content-Type": "application/json",
-                "X-Requested-With": "XMLHttpRequest",
-                "Accept": "application/json, text/plain, */*",
-                "Referer": BASE_URL + "/login"
-            }
             logger.info("إرسال طلب تسجيل الدخول...")
             response = await page.request.post(
                 login_url,
                 data=json.dumps(login_payload),
-                headers=headers
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": BASE_URL + "/login"
+                }
             )
             body_text = await response.text()
-            logger.info(f"استجابة تسجيل الدخول: الحالة {response.status} - المقطع الأول: {body_text[:200]}")
+            logger.info(f"استجابة تسجيل الدخول: الحالة {response.status} - البداية: {body_text[:200]}")
 
             if response.status != 200:
-                logger.error(f"فشل تسجيل الدخول: {response.status} - {body_text[:500]}")
+                logger.error(f"فشل تسجيل الدخول: 403 - {body_text[:400]}")
                 return None
 
             await page.wait_for_timeout(2000)
@@ -172,7 +174,6 @@ async def test_session(cookies: str) -> bool:
 async def api_call(endpoint: str, data: dict) -> Optional[dict]:
     cookies = await get_valid_session()
     if not cookies:
-        logger.error("لا توجد جلسة API صالحة")
         return None
     url = f"{BASE_URL}{endpoint}"
     headers = {"Cookie": cookies, "Keep-Alive": "True", "Content-Type": "application/json"}
@@ -191,17 +192,14 @@ async def api_call(endpoint: str, data: dict) -> Optional[dict]:
                                 return await retry_resp.json()
                             else:
                                 logger.error(f"فشل إعادة المحاولة: {retry_resp.status}")
-                                return None
-                    else:
-                        return None
                 else:
                     logger.error(f"خطأ API: {resp.status} - {await resp.text()}")
-                    return None
+                return None
     except Exception as e:
         logger.exception(f"استثناء أثناء استدعاء {endpoint}")
         return None
 
-# ---------- أوامر البوت ----------
+# ---------- البوت ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -209,7 +207,7 @@ dp = Dispatcher()
 async def cmd_start(message: Message):
     user = db_get_user(message.from_user.id)
     if user:
-        await message.answer("أهلاً بعودتك! أنت مسجل بالفعل.\nاستخدم:\n/balance\n/deposit <المبلغ>\n/withdraw <المبلغ>")
+        await message.answer("أهلاً بعودتك!\n/balance\n/deposit <المبلغ>\n/withdraw <المبلغ>")
     else:
         await message.answer("مرحبًا! أرسل /register لإنشاء لاعب جديد.")
 
@@ -217,7 +215,7 @@ async def cmd_start(message: Message):
 async def cmd_register(message: Message):
     user = db_get_user(message.from_user.id)
     if user:
-        await message.answer("لديك لاعب بالفعل. استخدم /balance لعرض رصيدك.")
+        await message.answer("لديك لاعب بالفعل.")
         return
     telegram_id = message.from_user.id
     login = f"tg{telegram_id}"
@@ -238,11 +236,9 @@ async def cmd_register(message: Message):
         player_id = result["playerId"]
         db_create_user(telegram_id, player_id, email, login)
         await message.answer(
-            f"✅ تم إنشاء لاعبك بنجاح!\n\n"
-            f"<b>معرف اللاعب:</b> <code>{player_id}</code>\n"
-            f"<b>البريد:</b> {email}\n"
-            f"<b>كلمة المرور:</b> {password}\n\n"
-            "استخدم:\n/balance - لمعرفة رصيدك\n/deposit <المبلغ> - إيداع\n/withdraw <المبلغ> - سحب"
+            f"✅ تم إنشاء لاعبك!\n<b>المعرف:</b> <code>{player_id}</code>\n"
+            f"البريد: {email}\nكلمة المرور: {password}\n\n"
+            "استخدم:\n/balance\n/deposit <المبلغ>\n/withdraw <المبلغ>"
         )
     else:
         await message.answer("❌ فشل إنشاء اللاعب.")
