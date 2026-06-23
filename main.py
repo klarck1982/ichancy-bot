@@ -21,7 +21,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------- إعدادات ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 AGENT_USERNAME = os.getenv("AGENT_USERNAME")
 AGENT_PASSWORD = os.getenv("AGENT_PASSWORD")
@@ -32,7 +31,6 @@ PORT = int(os.getenv("PORT", 10000))
 
 DB_PATH = "bot_data.db"
 
-# ---------- قاعدة بيانات ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -88,7 +86,7 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- تسجيل الدخول (باستخدام Playwright فقط مع حقن مكافح للكشف) ----------
+# ---------- تسجيل الدخول (Playwright فقط مع حقن مضاد للكشف) ----------
 async def playwright_login() -> Optional[str]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
