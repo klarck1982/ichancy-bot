@@ -2,9 +2,9 @@ import os
 import json
 import logging
 import sqlite3
+import traceback
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any
-import asyncio
 
 from dotenv import load_dotenv
 import aiohttp
@@ -14,13 +14,14 @@ from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from fastapi import FastAPI, Request
 import uvicorn
-import cloudscraper
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
 
+# تفعيل تسجيل الأخطاء بالتفصيل
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+logging.getLogger("aiogram").setLevel(logging.DEBUG)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 AGENT_USERNAME = os.getenv("AGENT_USERNAME")
@@ -61,9 +62,7 @@ def db_get_session_cookies() -> Optional[str]:
     c.execute("SELECT cookies FROM agent_session WHERE id=1")
     row = c.fetchone()
     conn.close()
-    if row:
-        return row[0]
-    return None
+    return row[0] if row else None
 
 def db_save_session_cookies(cookies: str):
     conn = sqlite3.connect(DB_PATH)
@@ -90,133 +89,63 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- مدير الجلسة (cloudscraper + وضع يدوي) ----------
-scraper = None  # cloudscraper session
-manual_cookies = None  # cookies provided by user via /setcookie
-
-def try_auto_login() -> Optional[str]:
-    """محاولة تسجيل الدخول تلقائياً باستخدام cloudscraper"""
-    global scraper
-    try:
-        scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'mobile': False
-            }
-        )
-        # 1. جلب الصفحة الرئيسية لتفعيل Cloudflare
-        logger.info("جلب الصفحة الرئيسية عبر cloudscraper...")
-        resp = scraper.get(BASE_URL)
-        logger.info(f"استجابة الصفحة الرئيسية: {resp.status_code}")
-
-        # 2. تسجيل الدخول
-        login_url = f"{BASE_URL}/global/api/User/signIn"
-        payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
-        headers = {
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": BASE_URL + "/login",
-            "Origin": BASE_URL
-        }
-        resp = scraper.post(login_url, json=payload, headers=headers)
-        if resp.status_code == 200:
-            # استخراج الكوكيز
-            cookies_dict = scraper.cookies.get_dict()
-            cookie_str = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
-            logger.info("تم تسجيل الدخول تلقائياً!")
-            return cookie_str
-        else:
-            logger.error(f"فشل تلقائي: {resp.status_code} - {resp.text[:200]}")
-            return None
-    except Exception as e:
-        logger.exception("خطأ في المحاولة التلقائية")
-        return None
-
-def api_call_via_cloudscraper(endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
-    global scraper
-    if not scraper:
+# ---------- استدعاء API ----------
+async def api_call(endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
+    cookies = db_get_session_cookies()
+    if not cookies:
+        logger.error("لا توجد كوكيز محفوظة")
         return None
     url = f"{BASE_URL}{endpoint}"
     headers = {
+        "Cookie": cookies,
         "Content-Type": "application/json",
         "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/plain, */*",
         "Referer": BASE_URL + "/login",
         "Origin": BASE_URL
     }
     try:
-        resp = scraper.post(url, json=data, headers=headers)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            logger.error(f"API call failed: {resp.status_code} - {resp.text[:200]}")
-            return None
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=data, headers=headers, timeout=30) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    body = await resp.text()
+                    logger.error(f"API call failed: {resp.status} - {body[:200]}")
+                    return None
     except Exception as e:
         logger.exception(f"Error calling API {endpoint}")
         return None
 
-def api_call_via_cookies(endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
-    """استخدام الكوكيز اليدوية مع aiohttp (بشكل متزامن)"""
-    cookies = db_get_session_cookies()
-    if not cookies:
-        return None
-    url = f"{BASE_URL}{endpoint}"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": BASE_URL + "/login",
-        "Origin": BASE_URL,
-        "Cookie": cookies
-    }
-    # استخدام requests عادي متزامن لأن aiohttp غير متزامن، لكننا سنلفه في async لاحقاً
-    import requests
-    try:
-        resp = requests.post(url, json=data, headers=headers)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            logger.error(f"API call (manual cookies) failed: {resp.status_code} - {resp.text[:200]}")
-            return None
-    except Exception as e:
-        logger.exception(f"Error calling API {endpoint}")
-        return None
-
-async def call_api(endpoint: str, data: dict) -> Optional[dict]:
-    # تفضل الطريقة اليدوية إذا كانت الكوكيز موجودة
-    if db_get_session_cookies():
-        # تشغيل في thread pool لأن requests متزامن
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, api_call_via_cookies, endpoint, data)
-    # وإلا جرب التلقائي
-    return api_call_via_cloudscraper(endpoint, data)
-
-# ---------- البوت ----------
+# ---------- بوت تيليجرام ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("مرحبًا! للاستخدام:\n/register - إنشاء لاعب\n/balance - عرض الرصيد\n/deposit <مبلغ>\n/withdraw <مبلغ>\n\nللمشرف: /setcookie <الكوكيز> لتحديث الجلسة")
+    await message.answer("مرحبًا! أرسل /setcookie مع الكوكيز لبدء العمل.")
 
 @dp.message(Command("setcookie"))
 async def cmd_setcookie(message: Message):
-    # استخراج الكوكيز من الرسالة
     try:
         cookie_text = message.text.replace("/setcookie", "").strip()
         if not cookie_text:
-            await message.answer("يرجى إرسال الكوكيز بعد الأمر. مثال:\n/setcookie PHPSESSID=abc; cf_clearance=xyz; ...")
+            await message.answer("❌ يرجى إرسال الكوكيز بعد الأمر.")
             return
         db_save_session_cookies(cookie_text)
-        await message.answer("✅ تم حفظ الكوكيز بنجاح. جرب /balance الآن.")
+        await message.answer("✅ تم حفظ الكوكيز بنجاح!")
     except Exception as e:
-        await message.answer("فشل حفظ الكوكيز. تأكد من الصيغة.")
+        logger.exception("Error saving cookies")
+        await message.answer("فشل حفظ الكوكيز.")
 
 @dp.message(Command("register"))
 async def cmd_register(message: Message):
     user = db_get_user(message.from_user.id)
     if user:
         await message.answer("لديك لاعب بالفعل.")
+        return
+    if not db_get_session_cookies():
+        await message.answer("لا توجد جلسة. أرسل /setcookie أولاً.")
         return
     telegram_id = message.from_user.id
     login = f"tg{telegram_id}"
@@ -232,7 +161,7 @@ async def cmd_register(message: Message):
         }
     }
     await message.answer("جاري إنشاء حسابك...")
-    result = await call_api("/global/api/Player/registerPlayer", payload)
+    result = await api_call("/global/api/Player/registerPlayer", payload)
     if result and "playerId" in result:
         player_id = result["playerId"]
         db_create_user(telegram_id, player_id, email, login)
@@ -242,7 +171,7 @@ async def cmd_register(message: Message):
             "استخدم:\n/balance\n/deposit <المبلغ>\n/withdraw <المبلغ>"
         )
     else:
-        await message.answer("❌ فشل إنشاء اللاعب. تأكد من صلاحية الجلسة (/setcookie)")
+        await message.answer("❌ فشل إنشاء اللاعب. ربما الكوكيز غير صالحة.")
 
 @dp.message(Command("balance"))
 async def cmd_balance(message: Message):
@@ -250,11 +179,11 @@ async def cmd_balance(message: Message):
     if not user:
         await message.answer("ليس لديك لاعب. أرسل /register أولاً.")
         return
-    result = await call_api("/global/api/Player/getPlayerBalanceById", {"playerId": user["player_id"]})
+    result = await api_call("/global/api/Player/getPlayerBalanceById", {"playerId": user["player_id"]})
     if result and "balance" in result:
         await message.answer(f"💰 رصيدك الحالي: {result['balance']} NSP")
     else:
-        await message.answer("❌ تعذر جلب الرصيد. ربما انتهت الجلسة، استخدم /setcookie.")
+        await message.answer("❌ تعذر جلب الرصيد. انتهت الجلسة؟ أرسل /setcookie بكويكز جديدة.")
 
 @dp.message(Command("deposit"))
 async def cmd_deposit(message: Message):
@@ -268,7 +197,7 @@ async def cmd_deposit(message: Message):
     except:
         await message.answer("مثال: /deposit 500")
         return
-    result = await call_api("/global/api/Player/depositToPlayer", {
+    result = await api_call("/global/api/Player/depositToPlayer", {
         "amount": amount, "comment": None, "playerId": user["player_id"],
         "currencyCode": "NSP", "moneyStatus": 5
     })
@@ -286,54 +215,38 @@ async def cmd_withdraw(message: Message):
     except:
         await message.answer("مثال: /withdraw 200")
         return
-    result = await call_api("/global/api/Player/withdrawFromPlayer", {
+    result = await api_call("/global/api/Player/withdrawFromPlayer", {
         "amount": -amount, "comment": None, "playerId": user["player_id"],
         "currencyCode": "NSP", "moneyStatus": 5
     })
     await message.answer("✅ تم السحب." if result else "❌ فشل السحب.")
 
 # ---------- دورة الحياة ----------
-scheduler = AsyncIOScheduler()
-
-async def session_keepalive():
-    logger.info("فحص الجلسة...")
-    if db_get_session_cookies():
-        # اختبار الكوكيز اليدوية
-        test = api_call_via_cookies("/global/api/Statistics/getPlayersStatisticsPro", {"start":0,"limit":1,"filter":{}})
-        if test is None:
-            logger.warning("الكوكيز اليدوية غير صالحة، انتظر تحديث")
-    else:
-        # وضع تلقائي
-        test = api_call_via_cloudscraper("/global/api/Statistics/getPlayersStatisticsPro", {"start":0,"limit":1,"filter":{}})
-        if test is None:
-            logger.warning("فشل تلقائي للجلسة")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    # محاولة تلقائية أولى
-    auto_cookies = try_auto_login()
-    if auto_cookies:
-        db_save_session_cookies(auto_cookies)
-    else:
-        logger.warning("لم تنجح المحاولة التلقائية. في انتظار /setcookie")
-    scheduler.add_job(session_keepalive, "interval", minutes=10)
-    scheduler.start()
     webhook_url = f"{WEBHOOK_URL}/webhook"
-    await bot.set_webhook(webhook_url)
-    logger.info(f"Webhook set to {webhook_url}")
+    try:
+        await bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to {webhook_url}")
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
     yield
     await bot.delete_webhook()
-    scheduler.shutdown()
 
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    update = await request.json()
-    telegram_update = types.Update(**update)
-    await dp.feed_update(bot, telegram_update)
-    return {"ok": True}
+    try:
+        update = await request.json()
+        logger.debug(f"Received update: {update}")
+        telegram_update = types.Update(**update)
+        await dp.feed_update(bot, telegram_update)
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Error processing update: {e}\n{traceback.format_exc()}")
+        return {"ok": False, "error": str(e)}, 500
 
 @app.get("/health")
 async def health():
