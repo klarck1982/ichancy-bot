@@ -16,14 +16,12 @@ import uvicorn
 from playwright.async_api import async_playwright
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# استخدام playwright-extra للتهرب من الكشف
-from playwright_extra import async_playwright as extra_playwright
-
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# ---------- إعدادات ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 AGENT_USERNAME = os.getenv("AGENT_USERNAME")
 AGENT_PASSWORD = os.getenv("AGENT_PASSWORD")
@@ -34,7 +32,7 @@ PORT = int(os.getenv("PORT", 10000))
 
 DB_PATH = "bot_data.db"
 
-# ---------- قاعدة البيانات ----------
+# ---------- قاعدة بيانات ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -90,9 +88,9 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- تسجيل الدخول عبر Playwright (مع stealth مدمج من playwright-extra) ----------
+# ---------- تسجيل الدخول (باستخدام Playwright فقط مع حقن مكافح للكشف) ----------
 async def playwright_login() -> Optional[str]:
-    async with extra_playwright() as p:
+    async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
@@ -100,18 +98,20 @@ async def playwright_login() -> Optional[str]:
         )
         page = await context.new_page()
 
+        # حقن JavaScript لإخفاء علامات الأتمتة
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        """)
+
         try:
-            # 1. تحميل الصفحة الرئيسية لتمرير Cloudflare
             logger.info("فتح الصفحة الرئيسية...")
             await page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(8000)
 
-            # 2. تسجيل الدخول
             login_url = f"{BASE_URL}/global/api/User/signIn"
-            login_payload = {
-                "username": AGENT_USERNAME,
-                "password": AGENT_PASSWORD
-            }
+            login_payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
             logger.info("إرسال طلب تسجيل الدخول...")
             response = await page.request.post(
                 login_url,
@@ -124,10 +124,10 @@ async def playwright_login() -> Optional[str]:
                 }
             )
             body_text = await response.text()
-            logger.info(f"استجابة تسجيل الدخول: الحالة {response.status} - البداية: {body_text[:200]}")
+            logger.info(f"استجابة تسجيل الدخول: {response.status} - البداية: {body_text[:200]}")
 
             if response.status != 200:
-                logger.error(f"فشل تسجيل الدخول: 403 - {body_text[:400]}")
+                logger.error(f"فشل تسجيل الدخول: {response.status} - {body_text[:500]}")
                 return None
 
             await page.wait_for_timeout(2000)
@@ -174,6 +174,7 @@ async def test_session(cookies: str) -> bool:
 async def api_call(endpoint: str, data: dict) -> Optional[dict]:
     cookies = await get_valid_session()
     if not cookies:
+        logger.error("لا توجد جلسة API صالحة")
         return None
     url = f"{BASE_URL}{endpoint}"
     headers = {"Cookie": cookies, "Keep-Alive": "True", "Content-Type": "application/json"}
@@ -193,13 +194,13 @@ async def api_call(endpoint: str, data: dict) -> Optional[dict]:
                             else:
                                 logger.error(f"فشل إعادة المحاولة: {retry_resp.status}")
                 else:
-                    logger.error(f"خطأ API: {resp.status} - {await resp.text()}")
+                    logger.error(f"خطأ API: {resp.status}")
                 return None
     except Exception as e:
         logger.exception(f"استثناء أثناء استدعاء {endpoint}")
         return None
 
-# ---------- البوت ----------
+# ---------- أوامر البوت ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -291,7 +292,7 @@ async def cmd_withdraw(message: Message):
     })
     await message.answer("✅ تم السحب." if result else "❌ فشل السحب.")
 
-# ---------- FastAPI و Scheduler ----------
+# ---------- خادم الويب والمجدول ----------
 scheduler = AsyncIOScheduler()
 
 async def session_keepalive():
