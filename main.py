@@ -14,6 +14,7 @@ from aiogram.client.default import DefaultBotProperties
 from fastapi import FastAPI, Request
 import uvicorn
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
@@ -94,34 +95,57 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- Playwright: تسجيل الدخول والحصول على الكوكيز ----------
+# ---------- Playwright: تسجيل الدخول (معدلة) ----------
 async def playwright_login() -> Optional[str]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
+        # تفعيل التخفي
+        await stealth_async(page)
+
         try:
+            # 1. زيارة الصفحة الرئيسية وتجاوز تحدي Cloudflare
             logger.info("فتح الصفحة الرئيسية...")
             await page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
-            await page.wait_for_timeout(5000)
+            # انتظار إضافي لضمان انتهاء أي تحدي
+            await page.wait_for_timeout(7000)
 
+            # 2. تسجيل الدخول باستخدام fetch داخل الصفحة لضمان مشاركة كل الكوكيز
             login_url = f"{BASE_URL}/global/api/User/signIn"
-            login_payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
-            logger.info("إرسال طلب تسجيل الدخول...")
-            response = await page.request.post(
-                login_url,
-                data=json.dumps(login_payload),
-                headers={"Content-Type": "application/json"}
-            )
-            if response.status != 200:
-                logger.error(f"فشل تسجيل الدخول: {response.status}")
+            login_payload = {
+                "username": AGENT_USERNAME,
+                "password": AGENT_PASSWORD
+            }
+            logger.info("إرسال طلب تسجيل الدخول من داخل الصفحة...")
+            # استخدم page.evaluate لإجراء طلب POST من داخل سياق المتصفح
+            result = await page.evaluate("""
+                async (url, payload) => {
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    return { status: response.status, body: await response.text() };
+                }
+            """, login_url, login_payload)
+
+            if result["status"] != 200:
+                logger.error(f"فشل تسجيل الدخول: {result['status']} - {result['body'][:200]}")
                 return None
 
+            # 3. انتظار قصير
             await page.wait_for_timeout(2000)
+
+            # 4. جمع الكوكيز
             cookies = await context.cookies()
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             logger.info("تم جمع الكوكيز بنجاح")
             return cookie_str
+
         except Exception as e:
             logger.exception("خطأ أثناء تسجيل الدخول عبر Playwright")
             return None
@@ -199,7 +223,7 @@ async def api_call(endpoint: str, data: dict) -> Optional[dict]:
         logger.exception(f"استثناء أثناء استدعاء {endpoint}")
         return None
 
-# ---------- البوت ----------
+# ---------- أوامر البوت (لم تتغير) ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -322,7 +346,7 @@ async def cmd_withdraw(message: Message):
     else:
         await message.answer("❌ فشلت عملية السحب. تأكد من وجود رصيد كافٍ.")
 
-# ---------- خادم FastAPI مع lifespan صحيح ----------
+# ---------- خادم FastAPI ----------
 scheduler = AsyncIOScheduler()
 
 async def session_keepalive():
@@ -336,7 +360,6 @@ async def session_keepalive():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # بدء التشغيل
     init_db()
     await refresh_session()
     scheduler.add_job(session_keepalive, "interval", minutes=10)
@@ -345,7 +368,6 @@ async def lifespan(app: FastAPI):
     await bot.set_webhook(webhook_url)
     logger.info(f"Webhook set to {webhook_url}")
     yield
-    # إنهاء
     await bot.delete_webhook()
     scheduler.shutdown()
 
