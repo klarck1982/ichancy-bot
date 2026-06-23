@@ -4,6 +4,7 @@ import logging
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any
+from urllib.parse import urljoin
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
@@ -80,32 +81,53 @@ class BrowserManager:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
         self.page = await self.context.new_page()
-        # حقن لإخفاء علامات الأتمتة الأساسية
         await self.page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
         """)
-        # فتح الصفحة الرئيسية وتجاوز Cloudflare
-        logger.info("فتح الصفحة الرئيسية...")
-        await self.page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
-        await self.page.wait_for_timeout(8000)
-        logger.info("تم تجاوز Cloudflare والمتصفح جاهز.")
+
+        # 1. زيارة صفحة تسجيل الدخول (تضمن إنشاء جلسة PHP وCSRF)
+        login_page_url = urljoin(BASE_URL, "/login")
+        logger.info(f"زيارة صفحة تسجيل الدخول: {login_page_url}")
+        await self.page.goto(login_page_url, wait_until="networkidle", timeout=60000)
+        await self.page.wait_for_timeout(5000)
+
+        # 2. استخراج رمز CSRF إذا وُجد (في العادة داخل meta أو input مخفي)
+        csrf_token = await self.page.evaluate("""
+            () => {
+                const meta = document.querySelector('meta[name="csrf-token"]');
+                if (meta) return meta.content;
+                const input = document.querySelector('input[name="_csrf"]');
+                if (input) return input.value;
+                return null;
+            }
+        """)
+        self.csrf_token = csrf_token
+        if csrf_token:
+            logger.info(f"تم العثور على CSRF token: {csrf_token[:20]}...")
+        else:
+            logger.info("لم يتم العثور على CSRF token (قد لا يكون مطلوباً)")
+
+        logger.info("تم تحميل صفحة الدخول وجمع الجلسة.")
 
     async def api_call(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
-        """يرسل طلب API من خلال page.request.post (الذي يشارك الكوكيز) مع ترويسات Client Hints"""
         url = f"{BASE_URL}{endpoint}"
         headers = {
             "Content-Type": "application/json",
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/plain, */*",
-            "Referer": BASE_URL + "/login",
+            "Referer": urljoin(BASE_URL, "/login"),
             "Origin": BASE_URL,
             "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
             "Keep-Alive": "True"
         }
+        # إضافة رمز CSRF إن وُجد
+        if self.csrf_token:
+            headers["X-CSRF-TOKEN"] = self.csrf_token
+
         try:
             response = await self.page.request.post(url, data=json.dumps(data), headers=headers)
             body = await response.text()
@@ -138,11 +160,10 @@ class BrowserManager:
 
 browser_mgr = BrowserManager()
 
-# ---------- دالة استدعاء API مختصرة ----------
 async def call_api(endpoint: str, data: dict) -> Optional[dict]:
     return await browser_mgr.api_call(endpoint, data)
 
-# ---------- البوت ----------
+# ---------- البوت (بدون تغيير) ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -252,7 +273,7 @@ async def lifespan(app: FastAPI):
     await browser_mgr.start()
     login_ok = await browser_mgr.login()
     if not login_ok:
-        logger.error("تعذر تسجيل الدخول الأولي. سيتم إعادة المحاولة.")
+        logger.error("تعذر تسجيل الدخول الأولي.")
     scheduler.add_job(session_keepalive, "interval", minutes=5)
     scheduler.start()
     webhook_url = f"{WEBHOOK_URL}/webhook"
