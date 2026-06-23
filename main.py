@@ -3,10 +3,9 @@ import json
 import logging
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
-import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -47,25 +46,10 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS agent_session (
             id INTEGER PRIMARY KEY CHECK(id=1),
-            cookies TEXT NOT NULL,
+            cookies TEXT,
             last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    conn.commit()
-    conn.close()
-
-def db_get_session_cookies() -> Optional[str]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT cookies FROM agent_session WHERE id=1")
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def db_save_session_cookies(cookies: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO agent_session (id, cookies, last_login) VALUES (1, ?, CURRENT_TIMESTAMP)", (cookies,))
     conn.commit()
     conn.close()
 
@@ -87,126 +71,90 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- تسجيل الدخول (معدلة لاستخدام aiohttp مع كوكيز المتصفح) ----------
-async def playwright_login() -> Optional[str]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
+# ---------- مدير المتصفح العام ----------
+class BrowserManager:
+    def __init__(self):
+        self.browser = None
+        self.context = None
+        self.page = None
+
+    async def start(self):
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(headless=True)
+        self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
-        page = await context.new_page()
-
-        # حقن JavaScript لإخفاء علامات الأتمتة
-        await page.add_init_script("""
+        self.page = await self.context.new_page()
+        await self.page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
         """)
+        # فتح الصفحة الرئيسية مرة واحدة لتجاوز Cloudflare
+        logger.info("فتح الصفحة الرئيسية...")
+        await self.page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
+        await self.page.wait_for_timeout(8000)
+        logger.info("تم تجاوز Cloudflare والمتصفح جاهز.")
 
+    async def api_call(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
+        """ينفذ طلب API من داخل المتصفح ويعيد JSON"""
+        url = f"{BASE_URL}{endpoint}"
+        js_code = """
+        async (params) => {
+            const response = await fetch(params.url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': params.baseUrl + '/login'
+                },
+                body: JSON.stringify(params.data)
+            });
+            const text = await response.text();
+            return { status: response.status, body: text };
+        }
+        """
         try:
-            logger.info("فتح الصفحة الرئيسية...")
-            await page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
-            await page.wait_for_timeout(8000)
-
-            # جمع الكوكيز التي اكتسبتها الصفحة (بما فيها Cloudflare clearance)
-            playwright_cookies = await context.cookies()
-            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in playwright_cookies])
-            logger.info("كوكيز المتصفح بعد تحميل الصفحة الرئيسية: " + cookie_str[:200])
-
-            # الآن نرسل طلب تسجيل الدخول عبر aiohttp باستخدام هذه الكوكيز
-            login_url = f"{BASE_URL}/global/api/User/signIn"
-            login_payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
-            headers = {
-                "Content-Type": "application/json",
-                "X-Requested-With": "XMLHttpRequest",
-                "Accept": "application/json, text/plain, */*",
-                "Referer": BASE_URL + "/login",
-                "Cookie": cookie_str,
-                "Keep-Alive": "True"
-            }
-            logger.info("إرسال طلب تسجيل الدخول عبر aiohttp...")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(login_url, json=login_payload, headers=headers, timeout=30) as resp:
-                    body_text = await resp.text()
-                    logger.info(f"استجابة تسجيل الدخول: {resp.status} - البداية: {body_text[:200]}")
-                    if resp.status != 200:
-                        logger.error(f"فشل تسجيل الدخول: {resp.status} - {body_text[:500]}")
-                        return None
-
-                    # نجاح تسجيل الدخول: نجمع الكوكيز من جديد (قد تضاف كوكيز جلسة جديدة)
-                    # ندمج الكوكيز القديمة مع الجديدة (عادةً تكفي القديمة لكن الأفضل إعادة جمع كل الكوكيز من السياق)
-                    updated_cookies = await context.cookies()
-                    final_cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in updated_cookies])
-                    logger.info("تم تسجيل الدخول بنجاح وجمع الكوكيز النهائية")
-                    return final_cookie_str
-
+            result = await self.page.evaluate(js_code, {"url": url, "data": data, "baseUrl": BASE_URL})
+            if result["status"] == 200:
+                try:
+                    return json.loads(result["body"])
+                except:
+                    return {"raw": result["body"]}
+            else:
+                logger.error(f"API call failed: {result['status']} - {result['body'][:300]}")
+                return None
         except Exception as e:
-            logger.exception("خطأ أثناء تسجيل الدخول")
+            logger.exception(f"Browser API call error for {endpoint}")
             return None
-        finally:
-            await browser.close()
 
-async def refresh_session():
-    logger.info("بدء تجديد الجلسة...")
-    cookies = await playwright_login()
-    if cookies:
-        db_save_session_cookies(cookies)
-        logger.info("تم تحديث الجلسة بنجاح")
-        return cookies
-    logger.error("فشل تجديد الجلسة")
-    return None
-
-async def get_valid_session() -> Optional[str]:
-    cookies = db_get_session_cookies()
-    if not cookies:
-        return await refresh_session()
-    if not await test_session(cookies):
-        logger.warning("الجلسة منتهية الصلاحية، جاري التجديد...")
-        return await refresh_session()
-    return cookies
-
-async def test_session(cookies: str) -> bool:
-    test_url = f"{BASE_URL}/global/api/Statistics/getPlayersStatisticsPro"
-    payload = {"start": 0, "limit": 1, "filter": {}}
-    headers = {"Cookie": cookies, "Keep-Alive": "True", "Content-Type": "application/json"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(test_url, json=payload, headers=headers, timeout=15) as resp:
-                return resp.status == 200
-    except:
+    async def login(self) -> bool:
+        """تسجيل دخول الوكيل"""
+        payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
+        result = await self.api_call("/global/api/User/signIn", payload)
+        if result is not None:
+            logger.info("تم تسجيل الدخول بنجاح.")
+            return True
+        logger.error("فشل تسجيل الدخول.")
         return False
 
-async def api_call(endpoint: str, data: dict) -> Optional[dict]:
-    cookies = await get_valid_session()
-    if not cookies:
-        logger.error("لا توجد جلسة API صالحة")
-        return None
-    url = f"{BASE_URL}{endpoint}"
-    headers = {"Cookie": cookies, "Keep-Alive": "True", "Content-Type": "application/json"}
+    async def close(self):
+        await self.browser.close()
+        await self.playwright.stop()
+
+browser_mgr = BrowserManager()
+
+# ---------- دالة مساعدة لاستدعاء API عبر المتصفح ----------
+async def call_api(endpoint: str, data: dict) -> Optional[dict]:
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=data, headers=headers, timeout=30) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                elif resp.status in (401, 403):
-                    logger.warning(f"فشل المصادقة للطلب {endpoint}. تجديد الجلسة...")
-                    new_cookies = await refresh_session()
-                    if new_cookies:
-                        headers["Cookie"] = new_cookies
-                        async with session.post(url, json=data, headers=headers, timeout=30) as retry_resp:
-                            if retry_resp.status == 200:
-                                return await retry_resp.json()
-                            else:
-                                logger.error(f"فشل إعادة المحاولة: {retry_resp.status}")
-                else:
-                    logger.error(f"خطأ API: {resp.status}")
-                return None
+        return await browser_mgr.api_call(endpoint, data)
     except Exception as e:
-        logger.exception(f"استثناء أثناء استدعاء {endpoint}")
+        logger.exception("call_api failed")
         return None
 
-# ---------- أوامر البوت (لم تتغير) ----------
+# ---------- أوامر البوت ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -238,7 +186,7 @@ async def cmd_register(message: Message):
         }
     }
     await message.answer("جاري إنشاء حسابك...")
-    result = await api_call("/global/api/Player/registerPlayer", payload)
+    result = await call_api("/global/api/Player/registerPlayer", payload)
     if result and "playerId" in result:
         player_id = result["playerId"]
         db_create_user(telegram_id, player_id, email, login)
@@ -256,7 +204,7 @@ async def cmd_balance(message: Message):
     if not user:
         await message.answer("ليس لديك لاعب. أرسل /register أولاً.")
         return
-    result = await api_call("/global/api/Player/getPlayerBalanceById", {"playerId": user["player_id"]})
+    result = await call_api("/global/api/Player/getPlayerBalanceById", {"playerId": user["player_id"]})
     if result and "balance" in result:
         await message.answer(f"💰 رصيدك الحالي: {result['balance']} NSP")
     else:
@@ -274,7 +222,7 @@ async def cmd_deposit(message: Message):
     except:
         await message.answer("مثال: /deposit 500")
         return
-    result = await api_call("/global/api/Player/depositToPlayer", {
+    result = await call_api("/global/api/Player/depositToPlayer", {
         "amount": amount, "comment": None, "playerId": user["player_id"],
         "currencyCode": "NSP", "moneyStatus": 5
     })
@@ -292,26 +240,32 @@ async def cmd_withdraw(message: Message):
     except:
         await message.answer("مثال: /withdraw 200")
         return
-    result = await api_call("/global/api/Player/withdrawFromPlayer", {
+    result = await call_api("/global/api/Player/withdrawFromPlayer", {
         "amount": -amount, "comment": None, "playerId": user["player_id"],
         "currencyCode": "NSP", "moneyStatus": 5
     })
     await message.answer("✅ تم السحب." if result else "❌ فشل السحب.")
 
-# ---------- خادم الويب والمجدول ----------
+# ---------- دورة الحياة ----------
 scheduler = AsyncIOScheduler()
 
 async def session_keepalive():
-    logger.info("فحص دوري للجلسة...")
-    cookies = db_get_session_cookies()
-    if not cookies or not await test_session(cookies):
-        await refresh_session()
+    # نقوم بعمل طلب خفيف للتأكد من أن الجلسة ما زالت صالحة
+    test = await browser_mgr.api_call("/global/api/Statistics/getPlayersStatisticsPro", {"start":0,"limit":1,"filter":{}})
+    if test is None:
+        logger.warning("جلسة المتصفح ضعيفة، إعادة تشغيل المتصفح...")
+        await browser_mgr.close()
+        await browser_mgr.start()
+        await browser_mgr.login()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    await refresh_session()
-    scheduler.add_job(session_keepalive, "interval", minutes=10)
+    await browser_mgr.start()
+    success = await browser_mgr.login()
+    if not success:
+        logger.error("فشل تسجيل الدخول الأولي. الخدمة ستعمل لكن البوت قد لا يستجيب.")
+    scheduler.add_job(session_keepalive, "interval", minutes=5)
     scheduler.start()
     webhook_url = f"{WEBHOOK_URL}/webhook"
     await bot.set_webhook(webhook_url)
@@ -319,6 +273,7 @@ async def lifespan(app: FastAPI):
     yield
     await bot.delete_webhook()
     scheduler.shutdown()
+    await browser_mgr.close()
 
 app = FastAPI(lifespan=lifespan)
 
