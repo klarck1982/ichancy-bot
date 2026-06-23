@@ -66,7 +66,7 @@ def db_create_user(telegram_id: int, player_id: str, email: str, login: str):
     conn.commit()
     conn.close()
 
-# ---------- مدير المتصفح (يحاكي المستخدم الحقيقي) ----------
+# ---------- مدير المتصفح (انتظار الكوكيز ثم fetch) ----------
 class BrowserManager:
     def __init__(self):
         self.playwright = None
@@ -84,82 +84,87 @@ class BrowserManager:
         )
         self.page = await self.context.new_page()
 
-        # إخفاء علامات الأتمتة بشكل موسع
+        # إخفاء خصائص الأتمتة
         await self.page.add_init_script("""
-            // إخفاء webdriver
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            // تزوير plugins
             Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-            // تزوير languages
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            // تزوير chrome
             window.chrome = { runtime: {} };
-            // تزوير permissions
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-            );
         """)
 
-        # 1. زيارة صفحة تسجيل الدخول (تجاوز Cloudflare وتكوين الجلسة)
+        # 1. فتح صفحة الدخول
         login_page_url = urljoin(BASE_URL, "/login")
-        logger.info(f"زيارة صفحة الدخول: {login_page_url}")
+        logger.info("زيارة صفحة الدخول...")
         await self.page.goto(login_page_url, wait_until="networkidle", timeout=60000)
-        await self.page.wait_for_timeout(5000)
 
-        # 2. ملء نموذج الدخول وتسجيل الدخول
-        logger.info("ملء بيانات الدخول...")
-        try:
-            # نبحث عن حقول البريد وكلمة المرور (قد تختلف selectors، نستخدم أسماء شائعة)
-            await self.page.fill('input[type="email"], input[name="email"], input[name="username"]', AGENT_USERNAME)
-            await self.page.fill('input[type="password"], input[name="password"]', AGENT_PASSWORD)
-            # التقاط صورة للنموذج إذا أردت (اختياري)
-            # await self.page.screenshot(path="login_form.png")
-            await self.page.click('button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Sign in")')
-            # انتظر حتى يتم التحويل أو ظهور رسالة نجاح
-            await self.page.wait_for_load_state("networkidle")
-            await self.page.wait_for_timeout(3000)
-            logger.info("تم تقديم نموذج الدخول.")
-        except Exception as e:
-            logger.error(f"خطأ أثناء ملء النموذج: {e}")
-            # محاولة بديلة: إرسال طلب API مباشر كحل أخير
-            await self.api_login_fallback()
+        # 2. الانتظار حتى نحصل على كل من cf_clearance و __cf_bm (معًا)
+        logger.info("انتظار كوكيز Cloudflare (cf_clearance و __cf_bm)...")
+        for i in range(20):  # 20 محاولة، كل مرة ننتظر 1.5 ثانية
+            cookies = {c["name"]: c["value"] for c in await self.context.cookies()}
+            if "cf_clearance" in cookies and "__cf_bm" in cookies:
+                logger.info(f"تم الحصول على الكوكيز المطلوبة: cf_clearance={cookies['cf_clearance'][:30]}..., __cf_bm={cookies['__cf_bm'][:30]}...")
+                break
+            await self.page.wait_for_timeout(1500)
+        else:
+            logger.warning("لم يتم الحصول على __cf_bm، استمرار مع cf_clearance فقط")
 
-        # 3. جمع الكوكيز النهائية
-        cookies = await self.context.cookies()
-        self.cookies_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-        logger.info(f"تم جمع الكوكيز: {self.cookies_str[:200]}...")
-        # اختبار سريع للجلسة
+        # 3. تسجيل الدخول عبر fetch من داخل الصفحة
+        login_payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
+        login_url = f"{BASE_URL}/global/api/User/signIn"
+        js_code = """
+        async (params) => {
+            const response = await fetch(params.url, {
+                method: 'POST',
+                credentials: 'include',  // مهم: يرسل الكوكيز مع الطلب
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': params.loginPageUrl
+                },
+                body: JSON.stringify(params.data)
+            });
+            const text = await response.text();
+            return { status: response.status, body: text };
+        }
+        """
+        result = await self.page.evaluate(js_code, {
+            "url": login_url,
+            "data": login_payload,
+            "loginPageUrl": login_page_url
+        })
+        if result["status"] == 200:
+            logger.info("تسجيل الدخول ناجح.")
+        else:
+            logger.error(f"فشل تسجيل الدخول: {result['status']} - {result['body'][:300]}")
+            # محاولة بديلة باستخدام page.request.post مع الكوكيز المستخرجة
+            logger.info("محاولة بديلة باستخدام page.request.post...")
+            cookies_list = await self.context.cookies()
+            headers = {
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": login_page_url,
+                "Origin": BASE_URL,
+                "Cookie": "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
+            }
+            resp = await self.page.request.post(login_url, data=json.dumps(login_payload), headers=headers)
+            if resp.status == 200:
+                logger.info("تسجيل الدخول نجح عبر الطريقة البديلة.")
+            else:
+                logger.error(f"الطريقة البديلة فشلت: {resp.status} - {await resp.text()[:300]}")
+
+        # 4. جمع الكوكيز النهائية (يجب أن تحتوي الآن على PHPSESSID)
+        cookies_list = await self.context.cookies()
+        self.cookies_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies_list])
+        logger.info("تم تحديث الكوكيز النهائية.")
+
+        # 5. اختبار الجلسة
         if not await self.test_session():
             logger.error("فشل اختبار الجلسة بعد تسجيل الدخول!")
         else:
-            logger.info("الجلسة صالحة وتم تسجيل الدخول بنجاح.")
-
-    async def api_login_fallback(self):
-        """خطة بديلة: إرسال طلب API مباشر بنفس الكوكيز الحالية"""
-        payload = {"username": AGENT_USERNAME, "password": AGENT_PASSWORD}
-        url = f"{BASE_URL}/global/api/User/signIn"
-        headers = {
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": urljoin(BASE_URL, "/login"),
-            "Origin": BASE_URL,
-            "Cookie": self.cookies_str
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    if resp.status == 200:
-                        logger.info("تم تسجيل الدخول عبر API الاحتياطي.")
-                    else:
-                        logger.error(f"فشل API الاحتياطي: {resp.status}")
-        except Exception as e:
-            logger.error(f"خطأ في API الاحتياطي: {e}")
+            logger.info("الجلسة صالحة وجاهزة.")
 
     async def test_session(self) -> bool:
-        """اختبار صلاحية الجلسة عبر API خفيف"""
         test_url = f"{BASE_URL}/global/api/Statistics/getPlayersStatisticsPro"
         payload = {"start": 0, "limit": 1, "filter": {}}
         headers = {
@@ -175,7 +180,6 @@ class BrowserManager:
             return False
 
     async def api_call(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
-        """استدعاء API باستخدام كوكيز الجلسة المخزنة"""
         url = f"{BASE_URL}{endpoint}"
         headers = {
             "Cookie": self.cookies_str,
@@ -190,10 +194,7 @@ class BrowserManager:
                 async with session.post(url, json=data, headers=headers, timeout=30) as resp:
                     body = await resp.text()
                     if resp.status == 200:
-                        try:
-                            return json.loads(body)
-                        except:
-                            return {"raw": body}
+                        return json.loads(body)
                     else:
                         logger.error(f"API call failed: {resp.status} - {body[:200]}")
                         return None
@@ -212,7 +213,7 @@ browser_mgr = BrowserManager()
 async def call_api(endpoint: str, data: dict) -> Optional[dict]:
     return await browser_mgr.api_call(endpoint, data)
 
-# ---------- البوت (كما هو) ----------
+# ---------- البوت ----------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
